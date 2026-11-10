@@ -13,6 +13,21 @@ const environmentSchema = z.object({
   MAX_VIDEO_DURATION_SECONDS: z.coerce.number().int().min(1).max(3600).default(300),
   MAX_FRAMES: z.coerce.number().int().min(1).max(3600).default(300),
   FFMPEG_TIMEOUT_MS: z.coerce.number().int().min(1000).default(120000),
+  OPENAI_API_KEY: z.string().trim().default(''),
+  OPENAI_TRANSCRIPTION_MODEL: z.string().trim().min(1).default('gpt-4o-mini-transcribe'),
+  OPENAI_VISION_MODEL: z.string().trim().min(1).default('gpt-4o-mini'),
+  OPENAI_ANALYSIS_MODEL: z.string().trim().min(1).default('gpt-4o-mini'),
+  OPENAI_TIMEOUT_MS: z.coerce.number().int().min(1000).default(60000),
+  OPENAI_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
+  OPENAI_RETRY_BASE_DELAY_MS: z.coerce.number().int().min(0).default(500),
+  OPENAI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(256).max(8192).default(2000),
+  MAX_ANALYSIS_FRAMES: z.coerce.number().int().min(1).max(20).default(8),
+  ANALYSIS_FRAME_MAX_DIMENSION: z.coerce.number().int().min(256).max(2048).default(768),
+  ANALYSIS_JPEG_QUALITY: z.coerce.number().int().min(30).max(90).default(70),
+  MAX_ANALYSIS_FRAME_BYTES: z.coerce.number().int().min(50000).max(2000000).default(512000),
+  VISUAL_FRAME_DIFF_THRESHOLD: z.coerce.number().min(0).max(255).default(12),
+  MAX_TRANSCRIPTION_AUDIO_BYTES: z.coerce.number().int().min(1024).max(26214400).default(26214400),
+  ANALYSIS_TRANSCRIPT_MAX_CHARACTERS: z.coerce.number().int().min(1000).max(100000).default(20000),
 });
 
 const parsedEnvironment = environmentSchema.safeParse(process.env);

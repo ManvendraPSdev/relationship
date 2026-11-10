@@ -8,4 +8,4 @@ extracted/*
 *.log
 .DS_Store
 coverage/
-.test-tmp/
+.test-tmp*/

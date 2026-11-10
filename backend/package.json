@@ -9,7 +9,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/video.api.test.ts"
+    "test": "tsx --test tests/video.api.test.ts tests/analysis.unit.test.ts"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -19,6 +19,8 @@
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
     "multer": "^2.0.1",
+    "openai": "^6.49.0",
+    "sharp": "^0.35.5",
     "zod": "^4.6.7"
   },
   "devDependencies": {

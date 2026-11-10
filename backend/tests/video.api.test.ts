@@ -4,22 +4,34 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
+import { setImmediate as waitForImmediate } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import request from 'supertest';
 import { app } from '../src/app';
 import { env } from '../src/config/env';
 import { ffmpegService } from '../src/services/ffmpeg.service';
+import { AIAnalysisError, reelAnalysisService } from '../src/services/reel-analysis.service';
 import { ensureStorageDirectories } from '../src/utils/file.utils';
+import { analysisResultFixture } from './helpers/analysis.fixtures';
 
 const executeFile = promisify(execFile);
 const fixturesDirectory = path.join(process.cwd(), '.test-tmp');
 const createdVideos: Array<{ videoId: string; extension: string }> = [];
+const originalAnalyze = reelAnalysisService.analyze;
+const defaultAnalyze: typeof originalAnalyze = async (videoId, input, onStage) => {
+  onStage?.('TRANSCRIBING');
+  await waitForImmediate();
+  onStage?.('ANALYZING_VISUALS');
+  await waitForImmediate();
+  onStage?.('GENERATING_ANALYSIS');
+  return analysisResultFixture(videoId, input);
+};
 
-async function createFixture(filename: string, withAudio: boolean, duration: number): Promise<string> {
+async function createFixture(filename: string, withAudio: boolean, duration: number, staticVisual = false): Promise<string> {
   const fixturePath = path.join(fixturesDirectory, filename);
   const args = [
     '-y',
-    '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=24',
+    '-f', 'lavfi', '-i', staticVisual ? 'color=c=black:size=320x240:rate=24' : 'testsrc2=size=320x240:rate=24',
   ];
 
   if (withAudio) {
@@ -32,6 +44,18 @@ async function createFixture(filename: string, withAudio: boolean, duration: num
 
   await executeFile(env.FFMPEG_PATH, args, { timeout: 30_000 });
   return fixturePath;
+}
+
+async function waitForStage(videoId: string, expectedStage: string) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const response = await request(app).get(`/api/v1/videos/${videoId}/status`);
+    assert.equal(response.status, 200);
+    if (response.body.data.status === expectedStage) return response.body.data;
+    assert.notEqual(response.body.data.status, 'FAILED');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for ${videoId} to reach ${expectedStage}.`);
 }
 
 async function waitForTerminalStatus(videoId: string, expectedStatus: 'COMPLETED' | 'FAILED') {
@@ -47,6 +71,7 @@ async function waitForTerminalStatus(videoId: string, expectedStatus: 'COMPLETED
 }
 
 before(async () => {
+  reelAnalysisService.analyze = defaultAnalyze;
   const tools = await ffmpegService.checkAvailability();
   assert.ok(tools.ffmpeg && tools.ffprobe, 'FFmpeg and FFprobe are required for integration tests.');
   await ensureStorageDirectories();
@@ -54,6 +79,7 @@ before(async () => {
 });
 
 after(async () => {
+  reelAnalysisService.analyze = originalAnalyze;
   await Promise.all(createdVideos.map(async ({ videoId, extension }) => {
     await fs.rm(path.join(env.uploadPath, `${videoId}${extension}`), { force: true });
     await fs.rm(path.join(env.extractedPath, videoId), { recursive: true, force: true });
@@ -64,9 +90,11 @@ after(async () => {
 test('health endpoint reports FFmpeg and FFprobe availability', async () => {
   const response = await request(app).get('/api/v1/health');
   assert.equal(response.status, 200);
-  assert.equal(response.body.data.status, 'ok');
+  const expectedHealthy = Boolean(env.OPENAI_API_KEY);
+  assert.equal(response.body.data.status, expectedHealthy ? 'ok' : 'degraded');
   assert.equal(response.body.data.ffmpeg.available, true);
   assert.equal(response.body.data.ffprobe.available, true);
+  assert.equal(response.body.data.openai.configured, expectedHealthy);
 });
 
 test('MP4 upload stores video and extracts metadata, MP3 audio, and frames', async () => {
@@ -105,10 +133,19 @@ test('MP4 upload stores video and extracts metadata, MP3 audio, and frames', asy
   assert.equal(frameFiles.length, video.frames.count);
   assert.equal(metadataFile.videoId, videoId);
   assert.equal(metadataFile.status, 'COMPLETED');
+  assert.equal(metadataFile.analysis, 'analysis.json');
+
+  const analysisResponse = await request(app).get(`/api/v1/videos/${videoId}/analysis`);
+  assert.equal(analysisResponse.status, 200);
+  assert.equal(analysisResponse.body.data.analysis.summary.length > 0, true);
+  assert.equal(analysisResponse.body.data.analysis.transcript.status, 'COMPLETED');
+  assert.ok(!JSON.stringify(analysisResponse.body).includes(env.uploadPath));
+  const storedAnalysis = JSON.parse(await fs.readFile(path.join(processingDirectory, 'analysis.json'), 'utf8'));
+  assert.equal(storedAnalysis.videoId, videoId);
 });
 
 test('short MOV without audio completes with no MP3 and at least one frame', async () => {
-  const fixturePath = await createFixture('silent.mov', false, 0.6);
+  const fixturePath = await createFixture('silent.mov', false, 0.6, true);
   const uploadResponse = await request(app).post('/api/v1/videos/upload').attach('video', fixturePath);
 
   assert.equal(uploadResponse.status, 202);
@@ -122,10 +159,83 @@ test('short MOV without audio completes with no MP3 and at least one frame', asy
   assert.equal(detailResponse.body.data.frames.count, 1);
   assert.equal(detailResponse.body.data.metadata.audioCodec, null);
   assert.equal(detailResponse.body.data.metadata.format, 'mov');
+  assert.equal(detailResponse.body.data.analysisAvailable, true);
 
   const processingDirectory = path.join(env.extractedPath, videoId);
   await assert.rejects(fs.access(path.join(processingDirectory, 'audio.mp3')));
   assert.equal((await fs.readdir(path.join(processingDirectory, 'frames'))).length, 1);
+});
+
+test('analysis endpoint returns 202 while pending and reuses the stored result on repeated reads', async () => {
+  const fixturePath = await createFixture('pending-analysis.mp4', true, 0.8);
+  let releaseAnalysis!: () => void;
+  const analysisGate = new Promise<void>((resolve) => { releaseAnalysis = resolve; });
+  let analysisCalls = 0;
+  let receivedCaption: string | null = null;
+
+  reelAnalysisService.analyze = async (videoId, input, onStage) => {
+    analysisCalls += 1;
+    receivedCaption = input.caption;
+    onStage?.('TRANSCRIBING');
+    onStage?.('ANALYZING_VISUALS');
+    onStage?.('GENERATING_ANALYSIS');
+    await analysisGate;
+    return analysisResultFixture(videoId, input);
+  };
+
+  try {
+    const uploadResponse = await request(app)
+      .post('/api/v1/videos/upload')
+      .field('caption', 'A caption supplied for analysis.')
+      .attach('video', fixturePath);
+    assert.equal(uploadResponse.status, 202);
+    const videoId = uploadResponse.body.data.videoId as string;
+    createdVideos.push({ videoId, extension: '.mp4' });
+
+    await waitForStage(videoId, 'GENERATING_ANALYSIS');
+    const pending = await request(app).get(`/api/v1/videos/${videoId}/analysis`);
+    assert.equal(pending.status, 202);
+    assert.equal(pending.body.data.analysis, null);
+
+    releaseAnalysis();
+    await waitForTerminalStatus(videoId, 'COMPLETED');
+    const first = await request(app).get(`/api/v1/videos/${videoId}/analysis`);
+    const second = await request(app).get(`/api/v1/videos/${videoId}/analysis`);
+    assert.equal(first.status, 200);
+    assert.deepEqual(second.body.data, first.body.data);
+    assert.equal(analysisCalls, 1);
+    assert.equal(receivedCaption, 'A caption supplied for analysis.');
+  } finally {
+    releaseAnalysis();
+    reelAnalysisService.analyze = defaultAnalyze;
+  }
+});
+
+test('fatal AI failure marks the job FAILED, preserves extracted assets, and returns HTTP 409', async () => {
+  const fixturePath = await createFixture('ai-failure.mp4', false, 0.6);
+  reelAnalysisService.analyze = async (_videoId, _input, onStage) => {
+    onStage?.('GENERATING_ANALYSIS');
+    throw new AIAnalysisError('The AI provider is unavailable.');
+  };
+
+  try {
+    const uploadResponse = await request(app).post('/api/v1/videos/upload').attach('video', fixturePath);
+    const videoId = uploadResponse.body.data.videoId as string;
+    createdVideos.push({ videoId, extension: '.mp4' });
+    await waitForTerminalStatus(videoId, 'FAILED');
+
+    const analysisResponse = await request(app).get(`/api/v1/videos/${videoId}/analysis`);
+    assert.equal(analysisResponse.status, 409);
+    assert.match(analysisResponse.body.message, /AI provider is unavailable/);
+
+    const processingDirectory = path.join(env.extractedPath, videoId);
+    assert.ok((await fs.readdir(path.join(processingDirectory, 'frames'))).length > 0);
+    await assert.rejects(fs.access(path.join(processingDirectory, 'analysis.json')));
+    const metadata = JSON.parse(await fs.readFile(path.join(processingDirectory, 'metadata.json'), 'utf8'));
+    assert.equal(metadata.status, 'FAILED');
+  } finally {
+    reelAnalysisService.analyze = defaultAnalyze;
+  }
 });
 
 test('unsupported extensions and MIME mismatches are rejected', async () => {

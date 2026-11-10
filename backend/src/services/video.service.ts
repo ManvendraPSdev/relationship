@@ -5,6 +5,7 @@ import { env } from '../config/env';
 import type {
   ProcessingStatus,
   SupportedVideoExtension,
+  VideoAnalysisResponse,
   VideoJob,
   VideoProcessingInfo,
 } from '../types/video.types';
@@ -17,6 +18,7 @@ import {
 } from '../utils/file.utils';
 import { HttpError } from '../utils/http-error.utils';
 import { ffmpegService, VideoValidationError } from './ffmpeg.service';
+import { AIAnalysisError, reelAnalysisService } from './reel-analysis.service';
 
 function log(videoId: string, message: string): void {
   console.log(`[${new Date().toISOString()}] [video:${videoId}] ${message}`);
@@ -25,7 +27,7 @@ function log(videoId: string, message: string): void {
 class VideoService {
   private readonly jobs = new Map<string, VideoJob>();
 
-  acceptUpload(file: Express.Multer.File): VideoProcessingInfo {
+  acceptUpload(file: Express.Multer.File, caption: string | null = null): VideoProcessingInfo {
     const extension = path.extname(file.filename).toLowerCase() as SupportedVideoExtension;
     const videoId = z.string().uuid().parse(path.basename(file.filename, extension));
     const now = new Date().toISOString();
@@ -39,6 +41,8 @@ class VideoService {
       metadata: null,
       audio: null,
       frames: null,
+      caption,
+      analysis: null,
       error: null,
     };
 
@@ -60,6 +64,22 @@ class VideoService {
       status: job.status,
       updatedAt: job.updatedAt,
       error: job.error,
+    };
+  }
+
+  getAnalysis(videoId: string): VideoAnalysisResponse {
+    const job = this.getJob(videoId);
+    if (job.status === 'FAILED') {
+      throw new HttpError(409, job.error ?? 'Reel analysis failed.');
+    }
+    if (job.status === 'COMPLETED' && !job.analysis) {
+      throw new HttpError(500, 'The completed Reel analysis is unavailable.');
+    }
+
+    return {
+      videoId,
+      status: job.status,
+      analysis: job.analysis,
     };
   }
 
@@ -106,7 +126,15 @@ class VideoService {
         directory: toRelativeDirectory(framesDirectory),
       };
 
+      job.analysis = await reelAnalysisService.analyze(videoId, {
+        audioPath: job.audio.available ? audioPath : null,
+        framesDirectory,
+        metadata: job.metadata,
+        caption: job.caption,
+      }, (stage) => this.updateStatus(job, stage));
+
       const completedAt = new Date().toISOString();
+      await writeJsonFile(path.join(processingDirectory, 'analysis.json'), job.analysis);
       await writeJsonFile(path.join(processingDirectory, 'metadata.json'), {
         videoId,
         status: 'COMPLETED',
@@ -115,21 +143,44 @@ class VideoService {
         metadata: job.metadata,
         audio: job.audio,
         frames: job.frames,
+        analysis: 'analysis.json',
       });
 
       this.updateStatus(job, 'COMPLETED');
-      log(videoId, `Processing completed with ${frameFilenames.length} frame(s); audio=${job.audio.available}.`);
+      log(videoId, `Processing and AI analysis completed with ${frameFilenames.length} frame(s); audio=${job.audio.available}.`);
     } catch (error) {
       const isValidationError = error instanceof VideoValidationError;
+      const isAnalysisError = error instanceof AIAnalysisError;
+      const preserveExtractedAssets = isAnalysisError && job.frames !== null;
       this.updateStatus(job, 'FAILED');
-      job.error = isValidationError
+      job.error = isValidationError || isAnalysisError
         ? error.message
         : 'Video processing failed. Check server media tool configuration and try again.';
-      job.audio = null;
-      job.frames = null;
+      job.analysis = null;
 
       console.error(`[${new Date().toISOString()}] [video:${videoId}] Processing failed.`, error);
-      await this.cleanupFailedProcessing(job, processingDirectory, isValidationError);
+
+      if (preserveExtractedAssets) {
+        try {
+          await writeJsonFile(path.join(processingDirectory, 'metadata.json'), {
+            videoId,
+            status: 'FAILED',
+            createdAt: job.createdAt,
+            failedAt: job.updatedAt,
+            metadata: job.metadata,
+            audio: job.audio,
+            frames: job.frames,
+            analysis: null,
+            error: job.error,
+          });
+        } catch (metadataError) {
+          console.error(`[${new Date().toISOString()}] [video:${videoId}] Unable to persist failure metadata.`, metadataError);
+        }
+      } else {
+        job.audio = null;
+        job.frames = null;
+        await this.cleanupFailedProcessing(job, processingDirectory, isValidationError);
+      }
     }
   }
 
@@ -166,6 +217,7 @@ class VideoService {
       metadata: job.metadata,
       audio: job.audio,
       frames: job.frames,
+      analysisAvailable: Boolean(job.analysis),
       error: job.error,
     };
   }

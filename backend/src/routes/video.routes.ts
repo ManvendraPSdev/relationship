@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import {
+  getVideoAnalysisController,
   getVideoController,
   getVideoStatusController,
   uploadVideoController,
@@ -10,4 +11,5 @@ export const videoRouter = Router();
 
 videoRouter.post('/upload', uploadVideo, uploadVideoController);
 videoRouter.get('/:videoId/status', getVideoStatusController);
+videoRouter.get('/:videoId/analysis', getVideoAnalysisController);
 videoRouter.get('/:videoId', getVideoController);

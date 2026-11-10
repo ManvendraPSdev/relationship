@@ -1,4 +1,14 @@
-export const PROCESSING_STATUSES = ['UPLOADED', 'PROCESSING', 'COMPLETED', 'FAILED'] as const;
+import type { ReelAnalysisResult } from './analysis.types';
+
+export const PROCESSING_STATUSES = [
+  'UPLOADED',
+  'PROCESSING',
+  'TRANSCRIBING',
+  'ANALYZING_VISUALS',
+  'GENERATING_ANALYSIS',
+  'COMPLETED',
+  'FAILED',
+] as const;
 
 export type ProcessingStatus = (typeof PROCESSING_STATUSES)[number];
 export type SupportedVideoExtension = '.mp4' | '.mov';
@@ -35,6 +45,8 @@ export interface VideoJob {
   metadata: VideoMetadata | null;
   audio: AudioProcessingResult | null;
   frames: FrameProcessingResult | null;
+  caption: string | null;
+  analysis: ReelAnalysisResult | null;
   error: string | null;
 }
 
@@ -46,5 +58,12 @@ export interface VideoProcessingInfo {
   metadata: VideoMetadata | null;
   audio: AudioProcessingResult | null;
   frames: FrameProcessingResult | null;
+  analysisAvailable: boolean;
   error: string | null;
+}
+
+export interface VideoAnalysisResponse {
+  videoId: string;
+  status: ProcessingStatus;
+  analysis: ReelAnalysisResult | null;
 }
